@@ -12,7 +12,7 @@ So far, we've made 3 versions: </br>
 V1: Necto - Around Diamond level. </br>
 V2: Nexto - Approximately Grand Champion 1 level in 1v1, 2v2 and 3v3 (top 0.12%, 0.95%, 0.46% of the playerbase respectively)  </br>
 V3: Tecko - Canceled due to lack of improvement.  </br>
-V4: N/A - Moved to new project. </br>
+The project is not being worked on anymore, but there are many other bots being made for Rocket League in the [RLBot community](https://rlbot.org/).
 
 Some videos:
 - [2v1 showmatches against pros on our YouTube channel](https://www.youtube.com/c/RLGym/videos)
