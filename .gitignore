@@ -114,3 +114,9 @@ ENV/
 .vscode/
 *.code-workspace
 /src-alt/
+
+wandb
+clear_gifs
+nexto_clears.jsonl
+nexto_clears_deduped.jsonl
+example_clear.json
