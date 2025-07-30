@@ -1,5 +1,7 @@
 import numpy as np
 import torch
+import os
+import csv
 from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
 from rlbot.utils.structures.game_data_struct import GameTickPacket
 from rlbot.utils.structures.quick_chats import QuickChats
@@ -152,6 +154,134 @@ class Nexto(BaseAgent):
             if self.stochastic_kickoffs and packet.game_info.is_kickoff_pause:
                 beta = 0.5
             self.action, weights = self.agent.act(obs, beta)
+
+            # Clear logging setup
+            if not hasattr(self, "last_ball_y"):
+                self.last_ball_y = None
+                self.last_clear_touch = None
+
+            ball_y = packet.game_ball.physics.location.y
+            last_touch = packet.game_ball.latest_touch
+            # print(f"[DEBUG] latest_touch object: {last_touch}")
+            last_touch_player = getattr(last_touch, "player_name", None)
+            last_touch_team = getattr(last_touch, "team", None)
+            last_touch_time = getattr(last_touch, "time_seconds", None)
+            last_touch_index = getattr(last_touch, "player_index", None)
+
+            # Detect clear: ball crosses y=0 (center line) due to a new touch
+            clear_detected = False
+            clear_direction = None
+            if self.last_ball_y is not None and last_touch_time is not None:
+                # Ball crosses from one half to the other
+                if self.last_ball_y < 0 and ball_y >= 0:
+                    clear_direction = "neg_to_pos"
+                elif self.last_ball_y > 0 and ball_y <= 0:
+                    clear_direction = "pos_to_neg"
+
+                # Only log if this is a new touch and new direction (not the same as last logged clear)
+                if clear_direction is not None:
+                    if not hasattr(self, "last_logged_clear") or self.last_logged_clear != (last_touch_time, clear_direction):
+                        clear_detected = True
+                        self.last_logged_clear = (last_touch_time, clear_direction)
+
+            if clear_detected:
+                # Start a new buffer for this clear event
+                if not hasattr(self, "clear_windows"):
+                    self.clear_windows = []
+                self.clear_windows.append({
+                    "start_time": cur_time,
+                    "duration": 10.0,
+                    "clear_event": {
+                        "time": cur_time,
+                        "clearing_bot_index": last_touch_index,
+                        "clearing_team": last_touch_team,
+                        "clearing_player_name": last_touch_player,
+                        "ball_y_before": self.last_ball_y,
+                        "ball_y_after": ball_y,
+                        "ball_x": packet.game_ball.physics.location.x,
+                        "ball_z": packet.game_ball.physics.location.z,
+                        "ball_vel_x": packet.game_ball.physics.velocity.x,
+                        "ball_vel_y": packet.game_ball.physics.velocity.y,
+                        "ball_vel_z": packet.game_ball.physics.velocity.z,
+                        "blue_score": packet.teams[0].score if hasattr(packet, "teams") and len(packet.teams) > 0 else None,
+                        "orange_score": packet.teams[1].score if hasattr(packet, "teams") and len(packet.teams) > 1 else None
+                    },
+                    "game_window": []
+                })
+            self.last_ball_y = ball_y
+
+            # Record game state to all active clear windows and write finished ones to JSONL
+            import json
+            if hasattr(self, "clear_windows"):
+                # Maintain a set of logged clear IDs to prevent duplicates
+                if not hasattr(self, "logged_clear_ids"):
+                    self.logged_clear_ids = set()
+                finished = []
+                for window in self.clear_windows:
+                    # Record current game state
+                    # Add last toucher info to each frame for precise labeling
+                    last_touch = packet.game_ball.latest_touch
+                    state = {
+                        "time": cur_time,
+                        "ball": {
+                            "x": packet.game_ball.physics.location.x,
+                            "y": packet.game_ball.physics.location.y,
+                            "z": packet.game_ball.physics.location.z,
+                            "vel_x": packet.game_ball.physics.velocity.x,
+                            "vel_y": packet.game_ball.physics.velocity.y,
+                            "vel_z": packet.game_ball.physics.velocity.z,
+                        },
+                        "cars": [
+                            {
+                                "index": i,
+                                "team": car.team,
+                                "name": getattr(car, "name", None),
+                                "x": car.physics.location.x,
+                                "y": car.physics.location.y,
+                                "z": car.physics.location.z,
+                                "vel_x": car.physics.velocity.x,
+                                "vel_y": car.physics.velocity.y,
+                                "vel_z": car.physics.velocity.z,
+                                "rot_pitch": car.physics.rotation.pitch,
+                                "rot_yaw": car.physics.rotation.yaw,
+                                "rot_roll": car.physics.rotation.roll,
+                                "boost": car.boost,
+                                "is_demoed": car.is_demolished,
+                                "has_wheel_contact": car.has_wheel_contact,
+                            }
+                            for i, car in enumerate(packet.game_cars[:packet.num_cars])
+                        ],
+                        "blue_score": packet.teams[0].score if hasattr(packet, "teams") and len(packet.teams) > 0 else None,
+                        "orange_score": packet.teams[1].score if hasattr(packet, "teams") and len(packet.teams) > 1 else None,
+                        "last_touch": {
+                            "player_name": getattr(last_touch, "player_name", None),
+                            "player_index": getattr(last_touch, "player_index", None),
+                            "team": getattr(last_touch, "team", None),
+                            "time_seconds": getattr(last_touch, "time_seconds", None)
+                        } if last_touch is not None else None
+                    }
+                    window["game_window"].append(state)
+                    # If window is finished (10s elapsed), write to JSONL
+                    if cur_time - window["start_time"] >= window["duration"]:
+                        # Create a unique clear ID based on player, time, and direction
+                        clear_event = window["clear_event"]
+                        clear_id = (
+                            clear_event.get("clearing_player_name", ""),
+                            clear_event.get("time", ""),
+                            clear_event.get("ball_y_before", ""),
+                            clear_event.get("ball_y_after", ""),
+                        )
+                        if clear_id not in self.logged_clear_ids:
+                            self.logged_clear_ids.add(clear_id)
+                            log_path = os.path.join(os.path.dirname(__file__), "nexto_clears.jsonl")
+                            with open(log_path, "a", encoding="utf-8") as f:
+                                f.write(json.dumps({
+                                    "clear_event": window["clear_event"],
+                                    "game_window": window["game_window"]
+                                }) + "\n")
+                        finished.append(window)
+                # Remove finished windows
+                self.clear_windows = [w for w in self.clear_windows if w not in finished]
 
             if self.render:
                 positions = np.asarray([p.car_data.position for p in self.game_state.players] +
@@ -380,7 +510,3 @@ class Nexto(BaseAgent):
 
         if self.pesterCount > 0:
             self.pesterCount -= 1
-
-
-
-
