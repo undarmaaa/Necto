@@ -117,6 +117,6 @@ ENV/
 
 wandb
 clear_gifs
-nexto_clears.jsonl
-nexto_clears_deduped.jsonl
-example_clear.json
+jupyter_env
+replays
+logs
