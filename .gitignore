@@ -119,4 +119,7 @@ wandb
 clear_gifs
 jupyter_env
 replays
+nexto_clears_labeled.jsonl
+nexto_clears.jsonl
+tools/bin/rattletrap.exe
 logs
