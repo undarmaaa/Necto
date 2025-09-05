@@ -1,7 +1,9 @@
 import numpy as np
 import torch
 import os
+from datetime import datetime
 import csv
+from collections import deque
 from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
 from rlbot.utils.structures.game_data_struct import GameTickPacket
 from rlbot.utils.structures.quick_chats import QuickChats
@@ -130,6 +132,14 @@ class Nexto(BaseAgent):
         self.ticks += ticks_elapsed
         self.game_state.decode(packet, ticks_elapsed)
 
+        # --- Pre-clear buffer logic ---
+        # Store the last 3 seconds of game states (at 120fps, that's 360 frames)
+        PRE_CLEAR_SECONDS = 3.0
+        FPS = 120
+        PRE_CLEAR_FRAMES = int(PRE_CLEAR_SECONDS * FPS)
+        if not hasattr(self, "pre_clear_buffer"):
+            self.pre_clear_buffer = deque(maxlen=PRE_CLEAR_FRAMES)
+
         if self.isToxic:
             self.toxicity(packet)
 
@@ -168,15 +178,63 @@ class Nexto(BaseAgent):
             last_touch_time = getattr(last_touch, "time_seconds", None)
             last_touch_index = getattr(last_touch, "player_index", None)
 
-            # Detect clear: ball crosses y=0 (center line) due to a new touch
+            # Construct state for this tick (for pre_clear_buffer and clear windows)
+            state = {
+                "time": cur_time,
+                "ball": {
+                    "x": packet.game_ball.physics.location.x,
+                    "y": packet.game_ball.physics.location.y,
+                    "z": packet.game_ball.physics.location.z,
+                    "vel_x": packet.game_ball.physics.velocity.x,
+                    "vel_y": packet.game_ball.physics.velocity.y,
+                    "vel_z": packet.game_ball.physics.velocity.z,
+                },
+                "cars": [
+                    {
+                        "index": i,
+                        "team": car.team,
+                        "name": getattr(car, "name", None),
+                        "x": car.physics.location.x,
+                        "y": car.physics.location.y,
+                        "z": car.physics.location.z,
+                        "vel_x": car.physics.velocity.x,
+                        "vel_y": car.physics.velocity.y,
+                        "vel_z": car.physics.velocity.z,
+                        "rot_pitch": car.physics.rotation.pitch,
+                        "rot_yaw": car.physics.rotation.yaw,
+                        "rot_roll": car.physics.rotation.roll,
+                        "boost": car.boost,
+                        "is_demoed": car.is_demolished,
+                        "has_wheel_contact": car.has_wheel_contact,
+                    }
+                    for i, car in enumerate(packet.game_cars[:packet.num_cars])
+                ],
+                "blue_score": packet.teams[0].score if hasattr(packet, "teams") and len(packet.teams) > 0 else None,
+                "orange_score": packet.teams[1].score if hasattr(packet, "teams") and len(packet.teams) > 1 else None,
+                "last_touch": {
+                    "player_name": getattr(packet.game_ball.latest_touch, "player_name", None),
+                    "player_index": getattr(packet.game_ball.latest_touch, "player_index", None),
+                    "team": getattr(packet.game_ball.latest_touch, "team", None),
+                    "time_seconds": getattr(packet.game_ball.latest_touch, "time_seconds", None)
+                } if packet.game_ball.latest_touch is not None else None
+            }
+            # Always update pre_clear_buffer with the latest state (before clear detection)
+            self.pre_clear_buffer.append(state)
+
+            # Detect clear: ball is cleared from defensive third by the defending team
             clear_detected = False
             clear_direction = None
+            DEFENSIVE_THIRD_Y = 10240 / 3  # ~3413
             if self.last_ball_y is not None and last_touch_time is not None:
-                # Ball crosses from one half to the other
-                if self.last_ball_y < 0 and ball_y >= 0:
-                    clear_direction = "neg_to_pos"
-                elif self.last_ball_y > 0 and ball_y <= 0:
-                    clear_direction = "pos_to_neg"
+                # Determine defensive third for each team
+                if last_touch_team == 0:
+                    # Blue team clears from their defensive third (y < -DEFENSIVE_THIRD_Y to y >= -DEFENSIVE_THIRD_Y)
+                    if self.last_ball_y < -DEFENSIVE_THIRD_Y and ball_y >= -DEFENSIVE_THIRD_Y:
+                        clear_direction = "blue_defensive_clear"
+                elif last_touch_team == 1:
+                    # Orange team clears from their defensive third (y > DEFENSIVE_THIRD_Y to y <= DEFENSIVE_THIRD_Y)
+                    if self.last_ball_y > DEFENSIVE_THIRD_Y and ball_y <= DEFENSIVE_THIRD_Y:
+                        clear_direction = "orange_defensive_clear"
 
                 # Only log if this is a new touch and new direction (not the same as last logged clear)
                 if clear_direction is not None:
@@ -185,9 +243,14 @@ class Nexto(BaseAgent):
                         self.last_logged_clear = (last_touch_time, clear_direction)
 
             if clear_detected:
-                # Start a new buffer for this clear event
+                # Start a new buffer for this clear event, including 3 seconds of pre-clear data
                 if not hasattr(self, "clear_windows"):
                     self.clear_windows = []
+                # Select all frames from the buffer within the last 3 seconds before the clear event (by time, not just buffer length)
+                pre_clear_frames = []
+                if hasattr(self, "pre_clear_buffer"):
+                    clear_time = cur_time
+                    pre_clear_frames = [f for f in self.pre_clear_buffer if f["time"] >= clear_time - 3.0 and f["time"] <= clear_time]
                 self.clear_windows.append({
                     "start_time": cur_time,
                     "duration": 10.0,
@@ -206,7 +269,7 @@ class Nexto(BaseAgent):
                         "blue_score": packet.teams[0].score if hasattr(packet, "teams") and len(packet.teams) > 0 else None,
                         "orange_score": packet.teams[1].score if hasattr(packet, "teams") and len(packet.teams) > 1 else None
                     },
-                    "game_window": []
+                    "game_window": pre_clear_frames.copy()
                 })
             self.last_ball_y = ball_y
 
@@ -218,48 +281,7 @@ class Nexto(BaseAgent):
                     self.logged_clear_ids = set()
                 finished = []
                 for window in self.clear_windows:
-                    # Record current game state
-                    # Add last toucher info to each frame for precise labeling
-                    last_touch = packet.game_ball.latest_touch
-                    state = {
-                        "time": cur_time,
-                        "ball": {
-                            "x": packet.game_ball.physics.location.x,
-                            "y": packet.game_ball.physics.location.y,
-                            "z": packet.game_ball.physics.location.z,
-                            "vel_x": packet.game_ball.physics.velocity.x,
-                            "vel_y": packet.game_ball.physics.velocity.y,
-                            "vel_z": packet.game_ball.physics.velocity.z,
-                        },
-                        "cars": [
-                            {
-                                "index": i,
-                                "team": car.team,
-                                "name": getattr(car, "name", None),
-                                "x": car.physics.location.x,
-                                "y": car.physics.location.y,
-                                "z": car.physics.location.z,
-                                "vel_x": car.physics.velocity.x,
-                                "vel_y": car.physics.velocity.y,
-                                "vel_z": car.physics.velocity.z,
-                                "rot_pitch": car.physics.rotation.pitch,
-                                "rot_yaw": car.physics.rotation.yaw,
-                                "rot_roll": car.physics.rotation.roll,
-                                "boost": car.boost,
-                                "is_demoed": car.is_demolished,
-                                "has_wheel_contact": car.has_wheel_contact,
-                            }
-                            for i, car in enumerate(packet.game_cars[:packet.num_cars])
-                        ],
-                        "blue_score": packet.teams[0].score if hasattr(packet, "teams") and len(packet.teams) > 0 else None,
-                        "orange_score": packet.teams[1].score if hasattr(packet, "teams") and len(packet.teams) > 1 else None,
-                        "last_touch": {
-                            "player_name": getattr(last_touch, "player_name", None),
-                            "player_index": getattr(last_touch, "player_index", None),
-                            "team": getattr(last_touch, "team", None),
-                            "time_seconds": getattr(last_touch, "time_seconds", None)
-                        } if last_touch is not None else None
-                    }
+                    # Record current game state (already constructed above)
                     window["game_window"].append(state)
                     # If window is finished (10s elapsed), write to JSONL
                     if cur_time - window["start_time"] >= window["duration"]:
@@ -271,14 +293,33 @@ class Nexto(BaseAgent):
                             clear_event.get("ball_y_before", ""),
                             clear_event.get("ball_y_after", ""),
                         )
-                        if clear_id not in self.logged_clear_ids:
-                            self.logged_clear_ids.add(clear_id)
-                            log_path = os.path.join(os.path.dirname(__file__), "nexto_clears.jsonl")
-                            with open(log_path, "a", encoding="utf-8") as f:
-                                f.write(json.dumps({
-                                    "clear_event": window["clear_event"],
-                                    "game_window": window["game_window"]
-                                }) + "\n")
+                        # Prevent duplicate logs: only log if (clearing_team, clearing_player_name, clearing_second) is unique
+                        clear_time_sec = int(clear_event.get("time", 0))
+                        clear_key = (
+                            clear_event.get("clearing_team", None),
+                            clear_event.get("clearing_player_name", None),
+                            clear_time_sec
+                        )
+                        if not hasattr(self, "logged_clear_keys"):
+                            self.logged_clear_keys = set()
+                        if clear_key not in self.logged_clear_keys:
+                            self.logged_clear_keys.add(clear_key)
+                            # Date-sharded logging (UTC) with legacy file for backward compatibility
+                            logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+                            os.makedirs(logs_dir, exist_ok=True)
+                            daily_filename = f"nexto_clears_{datetime.utcnow().strftime('%Y-%m-%d')}.jsonl"
+                            daily_path = os.path.join(logs_dir, daily_filename)
+                            legacy_path = os.path.join(os.path.dirname(__file__), "nexto_clears.jsonl")
+                            payload = json.dumps({
+                                "clear_event": window["clear_event"],
+                                "game_window": window["game_window"]
+                            }) + "\n"
+                            # Write to sharded daily file
+                            with open(daily_path, "a", encoding="utf-8") as f:
+                                f.write(payload)
+                            # Also write to legacy single file for backward compatibility (can be disabled later)
+                            # with open(legacy_path, "a", encoding="utf-8") as f:
+                            #     f.write(payload)
                         finished.append(window)
                 # Remove finished windows
                 self.clear_windows = [w for w in self.clear_windows if w not in finished]

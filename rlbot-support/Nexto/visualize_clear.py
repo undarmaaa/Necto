@@ -7,6 +7,7 @@ import os
 import argparse
 from datetime import datetime
 import re
+from log_loader import shard_output_path_for_date
 
 def sanitize_label(label):
     # Remove non-alphanumeric characters for safe filenames
@@ -55,13 +56,15 @@ def plot_clear(clear_data, save_gif=False, gif_path="clear_animation.gif"):
     ball_dot, = ax.plot([], [], 'o', color='red', markersize=12, label='Ball')
     car_dots = []
     car_texts = []
-    for i in range(6):  # Up to 6 cars
+    max_cars = max((len(frame["cars"]) for frame in game_window), default=0)
+    max_cars = max(1, min(max_cars, 12))
+    for i in range(max_cars):  # Dynamically allocate markers for cars (cap at 12)
         dot, = ax.plot([], [], 'o', color='blue', markersize=8)
         car_dots.append(dot)
         text = ax.text(0, 0, "", fontsize=8, color='black')
         car_texts.append(text)
     # Info container outside play zone (above plot)
-    label_text = ax.text(0.01, 1.02, "", transform=ax.transAxes, fontsize=10,
+    label_text = ax.text(0.01, 1.02, "", transform=ax.transAxes, fontsize=8,
                         verticalalignment='bottom', ha='left', bbox=dict(boxstyle="round", fc="w"))
     clearer_text = ax.text(0.8, 1.02, "", transform=ax.transAxes, fontsize=10,
                         verticalalignment='bottom', ha='left')
@@ -128,14 +131,17 @@ def plot_clear(clear_data, save_gif=False, gif_path="clear_animation.gif"):
         # Ball
         ball_dot.set_data(frame["ball"]["x"], frame["ball"]["y"])
         # Cars
-        for i, car in enumerate(frame["cars"]):
-            color = "blue" if car["team"] == 0 else "orange"
-            car_dots[i].set_data(car["x"], car["y"])
+        used = min(len(frame["cars"]), len(car_dots))
+        for i in range(used):
+            car = frame["cars"][i]
+            color = "blue" if car.get("team", 0) == 0 else "orange"
+            car_dots[i].set_data(car.get("x", 0.0), car.get("y", 0.0))
             car_dots[i].set_color(color)
-            car_texts[i].set_position((car["x"], car["y"]))
-            car_texts[i].set_text(car["name"])
+            car_texts[i].set_position((car.get("x", 0.0), car.get("y", 0.0)))
+            display_name = car.get("name") or f"Car {car.get('team', 0)}-{car.get('index', i)}"
+            car_texts[i].set_text(display_name)
         # Hide unused car dots/texts
-        for j in range(len(frame["cars"]), 6):
+        for j in range(used, len(car_dots)):
             car_dots[j].set_data([], [])
             car_texts[j].set_text("")
         # Label and info (with colored clearer line)
@@ -151,9 +157,12 @@ def plot_clear(clear_data, save_gif=False, gif_path="clear_animation.gif"):
             clearer_color = "orange"
         else:
             clearer_color = "black"
+        # Show label, time, and score (time is back in main label area)
+        clear_time_safe = clear_event.get("time", frame.get("time", 0.0))
         label_text.set_text(
             f"Label: {label}\n"
-            f"Time: {frame['time']:.2f}\n"
+            f"Time: {frame.get('time', 0.0):.2f}\n"
+            f"Clear time: {clear_time_safe:.2f}\n"
             f"Score: {clear_data.get('score', 'N/A')}"
         )
         clearer_text.set_text(f"Clearer: {clearer_name}")
@@ -177,7 +186,7 @@ def plot_clear(clear_data, save_gif=False, gif_path="clear_animation.gif"):
         else:
             # Remove highlight circle if not at clear event
             [p.remove() for p in ax.patches]
-        return [ball_dot] + car_dots + car_texts + [label_text, scoreboard_text]
+        return [ball_dot] + car_dots + car_texts + [label_text, scoreboard_text, clearer_text]
 
     total_frames = len(game_window)
     if clear_idx is not None:
@@ -199,48 +208,128 @@ if __name__ == "__main__":
     parser.add_argument("--gif", action="store_true", help="Save the animation as a GIF instead of displaying it.")
     parser.add_argument("--output", type=str, default=None, help="Output GIF filename (overrides folder/timestamp logic if set)")
     parser.add_argument("--folder", type=str, default="clear_gifs", help="Output folder for GIFs (default: clear_gifs)")
-    parser.add_argument("--max-clears", type=int, default=None, help="If set, create GIFs for the first N clears in the file")
+    parser.add_argument("--max-clears", type=int, default=None, help="If set, create GIFs for the first N clears in the file (or first N matching labels if --labels is used)")
+    parser.add_argument("--start-index", type=int, default=None, help="Start index (1-based, inclusive) of clears to visualize in batch mode (applies after label filtering)")
+    parser.add_argument("--end-index", type=int, default=None, help="End index (1-based, inclusive) of clears to visualize in batch mode (applies after label filtering)")
+    parser.add_argument("--date", type=str, default=None, help='Select labeled shard by date "YYYY-MM-DD" (UTC) from logs/')
+    parser.add_argument("--labels", nargs="+", type=str, default=None, help="Filter clears by label(s), e.g., --labels good_pass trapped")
+    parser.add_argument("--count", type=int, default=None, help="Randomly sample this many clears from the filtered set")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility of sampling")
     args = parser.parse_args()
 
     # Path to labeled clears file
-    jsonl_path = os.path.join(os.path.dirname(__file__), "nexto_clears_labeled.jsonl")
+    base_dir = os.path.dirname(__file__)
+    if args.date:
+        jsonl_path = shard_output_path_for_date(args.date, labeled=True)
+    else:
+        jsonl_path = os.path.join(base_dir, "nexto_clears_labeled.jsonl")
+    if not os.path.isfile(jsonl_path):
+        print(f"File not found: {jsonl_path}")
+        exit(1)
 
-    if args.max_clears is not None and args.gif:
-        # Batch mode: create GIFs for first N clears
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        out_folder = os.path.join(os.path.dirname(__file__), args.folder)
-        os.makedirs(out_folder, exist_ok=True)
-        for i, line in enumerate(lines[:args.max_clears]):
+    # Optional reproducibility
+    if args.seed is not None:
+        random.seed(args.seed)
+
+    # Load and optionally filter lines by label(s)
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        all_lines = f.readlines()
+
+    lines = all_lines
+    if args.labels:
+        wanted = {s.lower() for s in args.labels}
+        filtered = []
+        for ln in all_lines:
+            try:
+                obj = json.loads(ln)
+            except Exception:
+                continue
+            if str(obj.get("label", "")).lower() in wanted:
+                filtered.append(ln)
+        lines = filtered
+
+    if not lines:
+        if args.labels:
+            print(f"No matching clears found for labels: {', '.join(args.labels)} in {jsonl_path}")
+        else:
+            print(f"No clears found in {jsonl_path}")
+        exit(1)
+
+    # Selection logic
+    selected_lines = None
+    offset = 0
+
+    # Random sampling by count from filtered set
+    if args.count is not None:
+        k = max(0, min(args.count, len(lines)))
+        if k == 0:
+            print("Requested count is 0; nothing to visualize.")
+            exit(0)
+        selected_lines = random.sample(lines, k)
+
+    # Range or first-N selection (applies after filtering); only triggers original batch mode when --gif was used previously,
+    # but we allow it regardless now.
+    elif (args.start_index is not None and args.end_index is not None):
+        start = max(args.start_index - 1, 0)
+        end = min(args.end_index, len(lines))
+        if end <= start:
+            print(f"Invalid range after filtering: start={args.start_index}, end={args.end_index}, total={len(lines)}")
+            exit(1)
+        selected_lines = lines[start:end]
+        offset = start
+
+    elif args.max_clears is not None:
+        selected_lines = lines[:args.max_clears]
+        offset = 0
+
+    # Default: single random clear
+    else:
+        selected_lines = [random.choice(lines)]
+        offset = 0
+
+    # Output/visualization
+    if args.gif:
+        # Single-selection with explicit output path
+        if len(selected_lines) == 1 and args.output:
+            try:
+                clear_data = json.loads(selected_lines[0])
+            except Exception as e:
+                print(f"Skipping due to JSON error: {e}")
+                exit(1)
+            label = clear_data.get('label', 'Unknown')
+            print(f"Saving GIF for label: {label} -> {args.output}")
+            # Ensure parent directory exists
+            out_dir = os.path.dirname(args.output)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            plot_clear(clear_data, save_gif=True, gif_path=args.output)
+        else:
+            out_folder = os.path.join(os.path.dirname(__file__), args.folder)
+            os.makedirs(out_folder, exist_ok=True)
+
+            for i, line in enumerate(selected_lines):
+                try:
+                    clear_data = json.loads(line)
+                except Exception as e:
+                    print(f"Skipping clear {offset + i + 1}: {e}")
+                    continue
+                label = clear_data.get('label', 'Unknown')
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                safe_label = sanitize_label(label)
+                gif_path = os.path.join(out_folder, f"{safe_label}_{timestamp}_{offset + i + 1}.gif")
+                print(f"Saving GIF for clear {offset + i + 1} with label: {label} -> {gif_path}")
+                plot_clear(clear_data, save_gif=True, gif_path=gif_path)
+
+            if len(selected_lines) > 1:
+                print(f"Saved {len(selected_lines)} GIF(s) to {out_folder}")
+    else:
+        # Display one-by-one
+        for i, line in enumerate(selected_lines):
             try:
                 clear_data = json.loads(line)
             except Exception as e:
-                print(f"Skipping clear {i+1}: {e}")
+                print(f"Skipping visualization {offset + i + 1}: {e}")
                 continue
             label = clear_data.get('label', 'Unknown')
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_label = sanitize_label(label)
-            gif_path = os.path.join(out_folder, f"{safe_label}_{timestamp}_{i+1}.gif")
-            print(f"Saving GIF for clear {i+1} with label: {label} -> {gif_path}")
-            plot_clear(clear_data, save_gif=True, gif_path=gif_path)
-        print(f"Saved GIFs for first {args.max_clears} clears to {out_folder}")
-    else:
-        # Single clear mode (random)
-        clear_data = load_random_clear(jsonl_path)
-        label = clear_data.get('label', 'Unknown')
-        print(f"Visualizing clear with label: {label}")
-
-        if args.gif:
-            # Determine output path
-            if args.output:
-                gif_path = args.output
-            else:
-                # Ensure output folder exists
-                out_folder = os.path.join(os.path.dirname(__file__), args.folder)
-                os.makedirs(out_folder, exist_ok=True)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                safe_label = sanitize_label(label)
-                gif_path = os.path.join(out_folder, f"{safe_label}_{timestamp}.gif")
-            plot_clear(clear_data, save_gif=True, gif_path=gif_path)
-        else:
+            print(f"Visualizing clear {offset + i + 1} with label: {label}")
             plot_clear(clear_data, save_gif=False)
